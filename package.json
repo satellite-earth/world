@@ -1,0 +1,18 @@
+{
+  "name": "@satellite-earth/world",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@satellite-earth/epoch": "^1.0.0",
+    "@satellite-earth/signal": "^1.0.0"
+  },
+  "author": {
+    "name": "Stuart Bowman",
+    "email": "sbowman@satellite.earth"
+  },
+  "license": "ISC"
+}
