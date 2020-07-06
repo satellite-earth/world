@@ -1,6 +1,6 @@
 
-const Epoch = require('@satellite-earth/dev-epoch');
-const Signal = require('@satellite-earth/dev-signal');
+const Epoch = require('@satellite-earth/epoch');
+const Signal = require('@satellite-earth/signal');
 
 class World {
 
