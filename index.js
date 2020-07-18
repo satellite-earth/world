@@ -332,8 +332,10 @@ class World {
 	// Detect recent blocks and apply confirmed signals to state
 	async advance (to) {
 
+		let directoryUpdates = [];
+		let clockUpdates = {};
 		let toBlock;
-
+		
 		if (!this.listening) {
 			console.log('In prog, skipped advance');
 			return;
@@ -371,7 +373,7 @@ class World {
 		try {
 
 			// Synchronize the clock with latest blocks
-			await this.earth.synchronizeClock({
+			clockUpdates = await this.earth.synchronizeClock({
 				startBlock: this.epoch.alpha,
 				getBlock: this.getBlock,
 				toBlock
@@ -386,7 +388,7 @@ class World {
 		try {
 
 			// Synchronize the directory to latest confirmed block
-			await this.earth.synchronizeDirectory(toBlock);
+			directoryUpdates = await this.earth.synchronizeDirectory(toBlock);
 
 		} catch (err) {
 			console.log('Failed to synchronize directory, skipped advance');
@@ -452,8 +454,15 @@ class World {
 		// Remember the latest block number included
 		this.position = toBlock;
 
-		// Fire event with new position and included/rejected signals
-		this.event('onAdvance', { included, rejected });
+		// Fire event with new position, included/rejected signals,
+		// new synchronized block data and new directory logs
+		this.event('onAdvance', {
+			position: toBlock,
+			included,
+			rejected,
+			clockUpdates,
+			directoryUpdates
+		});
 
 		// Resume listening
 		this.listen(true);
