@@ -64,7 +64,7 @@ const world = new World(earth, {
 	- `onBuffer` - `Function` - Called with signal that was received while world instance was in a non-listening state (e.g. during advance, or pending epoch release)
 	- `onReceive` - `Function` - Async function called with signal received
 	- `onIgnore` - `Function` - Async function called with `{ signal, error }` when the world instance declines to receive a signal
-	- `onAdvance` - `Function` - Async function called with signals `{ included, rejected }` after the world advances to a new block position
+	- `onAdvance` - `Function` - Async function called with an object containing `included` and `rejected` signals, in addition to `clockUpdates` (new synced block data) and `directoryUpdates` (from contract logs) and the final `position` (block number) after the world advances
 	- `onDrop` - `Function` - Returns array of signals when they are dropped from current epoch
 
 ## Properties
