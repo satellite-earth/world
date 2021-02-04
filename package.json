@@ -1,14 +1,14 @@
 {
   "name": "@satellite-earth/world",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@satellite-earth/epoch": "^1.0.0",
-    "@satellite-earth/signal": "^1.0.0"
+    "@satellite-earth/epoch": "^2.0.0",
+    "@satellite-earth/signal": "^2.0.0"
   },
   "author": {
     "name": "Stuart Bowman",

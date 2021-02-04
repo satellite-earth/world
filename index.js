@@ -1,6 +1,6 @@
-
 const Epoch = require('@satellite-earth/epoch');
 const Signal = require('@satellite-earth/signal');
+
 
 class World {
 
@@ -57,6 +57,9 @@ class World {
 		// Alias name of person who can sign new epochs
 		this.signer = config.signer;
 
+		// Called when historical epoch is loaded
+		this.onBuild = config.onBuild;
+
 		// Called just before signal is added to 'buffered'
 		this.onBuffer = config.onBuffer;
 
@@ -83,9 +86,6 @@ class World {
 
 		// Required to handle newly released epochs
 		this.releaseEpoch = config.releaseEpoch;
-
-		// Number of confirmations before including block
-		this.confirm = config.confirm || 12;
 
 		// Minimum block number of first epoch
 		this.genesis = config.genesis;
@@ -152,24 +152,42 @@ class World {
 			return state._signed_;
 		});
 
+		// Assemble current epoch
+		const current = { epoch, position: this.position };
+
+		if (options.initial) {
+			current.initial = initial;
+		}
+
 		// Signals tentatively included in current epoch
-		const signals = this.epoch.signals.filter(signal => {
+		current.signals = options.signals ? this.epoch.signals.filter(signal => {
 			return !options.since || signal.blockNumber >= options.since;
 		}).map(signal => {
 			return signal.payload;
-		});
+		}) : [];
 
 		// Uuids of dropped signals since last contact
-		const dropped = Object.keys(this.signals.dropped).filter(uuid => {
+		current.dropped = options.signals ? Object.keys(this.signals.dropped).filter(uuid => {
 			return !options.since || this.signals.dropped[uuid] >= options.since;
-		});
+		}) : [];
+		
+		// Include nameserver endpoints
+		const ns = Object.keys(this.earth.nameserver);
+		if (ns.length > 0) {
+			current.ns = {};
+			for (let name of ns) {
+				current.ns[name] = this.earth.nameserver[name].endpoint;
+			}
+		}
 
-		// Return meta data sufficient to reconstruct the
-		// entire state of the world up until the present
-		return {
-			current: { epoch, initial, signals, dropped, position: this.position },
-			history: this.history
-		};
+		const response = { current };
+
+		// Include previous epochs if requested
+		if (options.history) {
+			response.history = this.history;
+		}
+
+		return response;
 	}
 
 	// Adds a signal to pool awaiting verification after
@@ -177,7 +195,6 @@ class World {
 	receive (data) {
 
 		let signal;
-		let ok;
 
 		try {
 
@@ -194,12 +211,15 @@ class World {
 
 			// Check signed epoch uuid matches uuid of previous epoch
 			if (signal.epoch !== this.epoch.ancestor) {
-				throw Error('Epoch does not match');
+				throw Error('Epoch context inconsistent');
+			}
+
+			if (typeof signal.blockNumber === 'undefined') {
+				throw Error('Missing \'blockNumber\' param');
 			}
 
 			// Check that block has not already been included
-			const block = this.earth.clock.readHash(signal.block);
-			if (block && block.number <= this.position) {
+			if (signal.blockNumber <= this.position) {
 				throw Error('Block has already been included');
 			}
 
@@ -210,34 +230,27 @@ class World {
 				}
 			}
 
-			ok = true;
-
 		} catch (error) {
 			this.event('onIgnore', { signal, error });
+			return;
 		}
 
-		if (ok) { // Prevalidation ok
+		// Add this world's domain param
+		signal.addParams({ world: this.signer });
 
-			// Remove any existing location params
-			signal.clearLocation();
+		// If signal was previously dropped (this can
+		// happen when reloading signals on restart)
+		if (signal.dropped) {
 
-			// Add this world's domain param
-			signal.addParams({ world: this.signer });
+			// Repopulate its entry on the dropped record
+			this.signals.dropped[signal.uuid] = signal.dropped;
 
-			// If signal was previously dropped (this can
-			// happen when reloading signals on restart)
-			if (signal.dropped) {
+		} else { // Otherwise, proceed
 
-				// Repopulate its entry on the dropped record
-				this.signals.dropped[signal.uuid] = signal.dropped;
-
-			} else { // Otherwise, proceed
-
-				// Put the message in the received pool
-				// to be verified as the world advances
-				this.signals.received.push(signal);
-				this.event('onReceive', signal);
-			}
+			// Put the message in the received pool
+			// to be verified as the world advances
+			this.signals.received.push(signal);
+			this.event('onReceive', signal);
 		}
 	}
 
@@ -279,9 +292,9 @@ class World {
 
 		// Get epoch models sorted oldest to most recent
 		this.history = history ? history.map(item => {
-			return item instanceof Epoch ? item.payload : item;
+			return item instanceof Epoch ? item : new Epoch(item);
 		}).sort((a, b) => {
-			return a.number - b.number;
+			return parseInt(a._signed_.number) - parseInt(b._signed_.number);
 		}) : [];
 
 		if (this.history.length > 0) { // If historical epochs provided
@@ -289,7 +302,7 @@ class World {
 			// Iterate through historical epochs to build world
 			for (let i = 0; i < this.history.length; i++) {
 
-				const epoch = new Epoch(this.history[i]);
+				const epoch = new Epoch(this.history[i].payload);
 
 				// Download signal data and load into epoch.
 				// Epoch contains the logic for decoding the
@@ -301,6 +314,9 @@ class World {
 				await epoch.data(body, (state) => {
 					return Buffer.from(this.epoch.state[state.name].compressed);
 				});
+
+				// Fire event with inflated epoch
+				this.event('onBuild', epoch);
 
 				this.epoch = epoch;
 			}
@@ -329,115 +345,146 @@ class World {
 		this.listen(true);
 	}
 
-	// Detect recent blocks and apply confirmed signals to state
-	async advance (to) {
+	// Detect recent blocks and apply signals to state
+	async advance (toBlock = this.position) {
 
-		let directoryUpdates = [];
-		let clockUpdates = {};
-		let toBlock;
+		//let toBlock = to;
 		
 		if (!this.listening) {
-			console.log('In prog, skipped advance');
+			console.log('Synchronization in progress, skipped advance');
 			return;
 		}
 
-		try {
-
-			// Set 'toBlock' as provided value, or set automatically
-			// based on the latest block number minus confirmations
-			if (typeof to !== 'undefined') {
-				toBlock = to;
-			} else {
-				const latest = await this.earth.web3.eth.getBlockNumber();
-				toBlock = latest - this.confirm;
-			}			
-
-		} catch (err) {
-			console.log('Network error, skipped advance');
+		// Only sync clock if new blocks have been created since last advance
+		if (toBlock <= this.position && this.earth.clock.initialized) {
+			console.log('No new blocks, skipped advance');
 			return;
-		}
-
-		// Only sync clock if new blocks have
-		// been created since last advance
-		if (this.earth.clock.initialized) {
-			if ((toBlock <= this.position) || (toBlock === this.earth.clock.max.number)) {
-				console.log('No new blocks, skipped advance');
-				return;
-			}
 		}
 
 		// Stop listening for signals while advancing in time, signals
 		// received will be placed into the buffered array temporarily
 		this.listen(false);
 
-		try {
+		// Top level name records from Ethereum
+		let directoryUpdates = [];
 
-			// Synchronize the clock with latest blocks
-			clockUpdates = await this.earth.synchronizeClock({
-				startBlock: this.epoch.alpha,
-				getBlock: this.getBlock,
-				toBlock
-			});
+		// Block hash data for verifying signal timestamps
+		let clockUpdates = {};
 
-		} catch (err) {
-			console.log('Failed to synchronize clock, skipped advance');
-			this.listen(true); // Reset listener
-			return;
-		}
+		// Signals with confirmed timestamp
+		const detected = [];
 
-		try {
-
-			// Synchronize the directory to latest confirmed block
-			directoryUpdates = await this.earth.synchronizeDirectory(toBlock);
-
-		} catch (err) {
-			console.log('Failed to synchronize directory, skipped advance');
-			this.listen(true); // Reset listener
-			return;
-		}
-
-		// Signals that have reached min
-		// number of block confirmations
-		const confirmed = [];
-
-		// Signals waiting for confirmation
-		const pending = [];
-
-		// Signals verified and included in the epoch
-		const included = [];
-
-		// Signals that failed verification/inclusion
+		// Signals that failed verification
 		const rejected = [];
 
-		// Locate each signal against clock time
-		// and split into two arrays accordingly
+		// Signals that passed verification
+		const included = [];
+
+		// Signals waiting for detection
+		let pending = [];
+
+		// Sync clock with new blocks as necessary
+		if (!this.earth.clock.initialized || toBlock > this.position) {
+
+			// Get block numbers whose hashes need to be synced
+			const subset = this.signals.received.map(signal => {
+				return signal.blockNumber;
+			}).filter(n => {
+				return n <= toBlock;
+			});
+
+			try {
+
+				// Synchronize the clock with latest blocks
+				clockUpdates = await this.earth.synchronizeClock({
+					startBlock: this.epoch.alpha,
+					getBlock: this.getBlock,
+					toBlock,
+					subset
+				});
+
+			} catch (err) {
+				console.log('Failed to synchronize clock, skipped advance', err);
+				this.listen(true); // Reset listener
+				return;
+			}
+		}
+
+		// Sync top level directory as necessary
+		if (!this.earth.directory.initialized || toBlock > this.earth.directory.blockNumber ) {
+
+			try {
+
+				// Synchronize the directory to latest confirmed block
+				directoryUpdates = await this.earth.synchronizeDirectory(toBlock);
+
+			} catch (err) {
+				console.log('Failed to synchronize directory, skipped advance', err);
+				this.listen(true); // Reset listener
+				return;
+			}
+		}
+
+		// Loop across received signals
 		for (let signal of this.signals.received) {
-			signal.locateSync(this.earth);
-			if (signal.located && signal.blockNumber <= toBlock) {
-				confirmed.push(signal);
+
+			// If signal falls within range
+			if (signal.blockNumber <= toBlock) {
+
+				try {
+
+					// Compare signed blockhash to value
+					// from Ethereum to verify timestamp
+					signal.locateSync(this.earth.clock);
+					detected.push(signal);
+
+				} catch (error) {
+					this.event('onReject', { signal, error });
+					rejected.push(signal);
+				}
+
 			} else {
 				pending.push(signal);
 			}
 		}
 
+		// For those signals with a verified timestamp
+		if (detected.length > 0) {
+
+			try {
+
+				// Synchronize with nameserver(s) to get the latest namespace
+				// records for each sender. If any nameserver responds with an
+				// error, this could indicate that it has not yet synced to the
+				// required block position so signals are sent back to pending.
+				await this.earth.synchronizeNamespace(detected, toBlock);
+
+			} catch (err) {
+				console.log('Failed to synchronize namespace, skipped advance');
+				pending = pending.concat(detected);
+				this.listen(true); // Reset listener
+				return;
+			}			
+		}
+
 		// Keep pending signals for next advance
 		this.signals.received = pending;
 
-		// Sort confirmed signals temporal ascending with
+		// Sort detected signals temporal ascending with
 		// Signal's native deterministic comparator. It's
 		// critical that the order in which signals are
 		// included is unambigious so that all observers
 		// can agree on the final value of all states in
 		// the epoch after iterating across the signals.
-		confirmed.sort((a, b) => { return a.compare(b); });
+		detected.sort((a, b) => { return a.compare(b); });
 
 		// Loop through each signal to be applied
-		for (let signal of confirmed) {
+		for (let signal of detected) {
 
 			try { // Try to modify the state with signal data
 
 				// Verify authorship, integrity, and context
-				signal.verifySync(this.earth, this.earth.clock.readHash(signal.block).number);
+				signal.verifySync(this.earth);
 
 				// Include signal in current epoch
 				this.epoch.include(signal);
@@ -457,11 +504,11 @@ class World {
 		// Fire event with new position, included/rejected signals,
 		// new synchronized block data and new directory logs
 		this.event('onAdvance', {
-			position: toBlock,
 			included,
 			rejected,
 			clockUpdates,
-			directoryUpdates
+			directoryUpdates,
+			position: toBlock
 		});
 
 		// Resume listening
@@ -486,12 +533,14 @@ class World {
 		this.epoch.authorAlias = this.signer;
 		this.epoch.signature = signature;
 
-		// Sanity check - verify epoch signed by world signer
-		this.epoch.verifySync(this.earth, this.epoch.omega);
-
 		// Identify and record timestamp of the omega block
-		const { timestamp } = this.earth.clock.readNumber(this.epoch.omega);
-		this.epoch.addParams({ released: timestamp });
+		this.epoch.addParams({
+			released: this.earth.clock.readNumber(this.epoch.omega).timestamp,
+			blockNumber: this.epoch.omega
+		});
+
+		// Sanity check - verify epoch signed by world signer
+		this.epoch.verifySync(this.earth);
 
 		// Handle the newly released epoch. Wait for this
 		// call to succeed before initializing next epoch.
@@ -501,7 +550,7 @@ class World {
 		await this.releaseEpoch(this.epoch);
 
 		// Push the epoch into history
-		this.history.push(this.epoch.payload);
+		this.history.push(new Epoch(this.epoch.payload));
 
 		// Clear any remaining signal data
 		this.signals.buffered = [];
@@ -511,7 +560,7 @@ class World {
 		// Initialize succeeding epoch
 		this.epoch = await this.epoch.next({ name: this.signer });
 
-		// Resume listening
+		// Resume listening for signals
 		this.listen(true);
 	}
 
